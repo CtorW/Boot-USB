@@ -1,0 +1,221 @@
+#!/bin/bash
+
+# Color definitions
+BCyan='\033[1;36m'
+BGreen='\033[1;32m'
+BYellow='\033[1;33m'
+BRed='\033[1;31m'
+Color_Off='\033[0m'
+
+# --- Message Function ---
+msg() {
+    local type="$1"
+    local message="$2"
+    local color_prefix=""
+    local prefix=""
+
+    case "$type" in
+        INFO)
+            color_prefix="${BCyan}"
+            prefix="[INFO]"
+            ;;
+        SUCCESS)
+            color_prefix="${BGreen}"
+            prefix="[SUCCESS]"
+            ;;
+        WARN)
+            color_prefix="${BYellow}"
+            prefix="[WARN]"
+            ;;
+        ERROR)
+            color_prefix="${BRed}"
+            prefix="[ERROR]"
+            ;;
+        *)
+            echo "$message"
+            return
+            ;;
+    esac
+
+    echo -e "${color_prefix}${prefix}${Color_Off} ${message}"
+}
+
+# --- Check for Root Privileges ---
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        msg "ERROR" "This script must be run as root. Please use sudo."
+        exit 1
+    fi
+}
+
+# --- Install Dependencies ---
+install_dependencies() {
+    msg "INFO" "Checking and installing dependencies..."
+    if [ -f /etc/arch-release ]; then
+        pacman -Syu --noconfirm p7zip ventoy woeusb-ng &>/dev/null
+    elif [ -f /etc/lsb-release ]; then
+        add-apt-repository -y ppa:tomtomtom/woeusb &>/dev/null
+        apt-get update &>/dev/null
+        apt-get install -y woeusb p7zip-full &>/dev/null
+        # Ventoy installation for Ubuntu is manual, we'll guide the user.
+        if ! command -v ventoy &> /dev/null; then
+            msg "INFO" "Ventoy not found. Please download it from https://www.ventoy.net/en/download.html"
+            msg "INFO" "Extract the archive and run the VentoyGUI.x86_64 script."
+        fi
+    else
+        msg "WARN" "Unsupported OS. Please install dependencies manually."
+        msg "WARN" "Required: p7zip, woeusb (for Windows), ventoy (for Windows), dd (usually pre-installed)"
+    fi
+    msg "SUCCESS" "Dependency check complete."
+}
+
+# --- List USB Drives ---
+list_usb_drives() {
+    msg "INFO" "Available USB drives:"
+    lsblk -d -o NAME,SIZE,MODEL | grep -E 'sd[b-z]|mmcblk[0-9]'
+}
+
+# --- Create Bootable Linux USB ---
+create_linux_bootable() {
+    local iso_path="$1"
+    local usb_device="$2"
+
+    msg "INFO" "Unmounting all partitions on ${usb_device}..."
+    umount "${usb_device}"* &>/dev/null
+
+    msg "WARN" "This will format ${usb_device} and all data will be lost!"
+    read -p "Are you sure you want to continue? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        msg "INFO" "Operation cancelled."
+        exit 0
+    fi
+
+    msg "INFO" "Writing ISO to ${usb_device} using dd. This may take a while..."
+    dd if="$iso_path" of="$usb_device" bs=4M status=progress oflag=sync
+
+    if [ $? -eq 0 ]; then
+        msg "SUCCESS" "Bootable Linux USB created successfully on ${usb_device}."
+    else
+        msg "ERROR" "Failed to create bootable Linux USB."
+        exit 1
+    fi
+}
+
+# --- Create Bootable Windows USB ---
+create_windows_bootable() {
+    local iso_path="$1"
+    local usb_device="$2"
+
+    msg "INFO" "Choose your preferred tool to create the Windows bootable USB:"
+    select tool in "WoeUSB" "Ventoy"; do
+        case $tool in
+            WoeUSB)
+                msg "INFO" "Unmounting all partitions on ${usb_device}..."
+                umount "${usb_device}"* &>/dev/null
+
+                msg "WARN" "This will format ${usb_device} and all data will be lost!"
+                read -p "Are you sure you want to continue? (y/N): " confirm
+                if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                    msg "INFO" "Operation cancelled."
+                    exit 0
+                fi
+
+                msg "INFO" "Creating bootable Windows USB with WoeUSB..."
+                woeusb --device "$iso_path" "$usb_device"
+
+                if [ $? -eq 0 ]; then
+                    msg "SUCCESS" "Bootable Windows USB created successfully on ${usb_device}."
+                else
+                    msg "ERROR" "Failed to create bootable Windows USB with WoeUSB."
+                    exit 1
+                fi
+                break
+                ;;
+            Ventoy)
+                msg "INFO" "Installing Ventoy to ${usb_device}..."
+                msg "WARN" "This will format ${usb_device} and all data will be lost!"
+                read -p "Are you sure you want to continue? (y/N): " confirm_ventoy
+                if [[ ! "$confirm_ventoy" =~ ^[Yy]$ ]]; then
+                    msg "INFO" "Operation cancelled."
+                    exit 0
+                fi
+                ventoy -i -s on -g "$usb_device"
+
+                if [ $? -ne 0 ]; then
+                    msg "ERROR" "Ventoy installation failed."
+                    exit 1
+                fi
+
+                msg "INFO" "Mounting the Ventoy partition..."
+                local ventoy_partition="${usb_device}1"
+                local mount_point="/mnt/ventoy_usb"
+                mkdir -p "$mount_point"
+                mount "$ventoy_partition" "$mount_point"
+
+                msg "INFO" "Copying Windows ISO to the Ventoy USB..."
+                cp -v "$iso_path" "$mount_point/"
+
+                if [ $? -eq 0 ]; then
+                    msg "SUCCESS" "Windows ISO copied to Ventoy USB successfully."
+                else
+                    msg "ERROR" "Failed to copy Windows ISO to Ventoy USB."
+                fi
+                umount "$mount_point"
+                rmdir "$mount_point"
+                break
+                ;;
+            *)
+                msg "ERROR" "Invalid option."
+                ;;
+        esac
+    done
+}
+
+
+# --- Main Script ---
+main() {
+    check_root
+    install_dependencies
+
+    echo "----------------------------------------"
+    echo "  Windows & Linux Bootable USB Creator  "
+    echo "----------------------------------------"
+
+    PS3="Select the type of ISO you want to flash: "
+    select os_type in "Windows" "Linux"; do
+        case $os_type in
+            Windows)
+                read -e -p "Enter the path to the Windows ISO file: " iso_path
+                break
+                ;;
+            Linux)
+                read -e -p "Enter the path to the Linux ISO file: " iso_path
+                break
+                ;;
+            *)
+                msg "ERROR" "Invalid option."
+                ;;
+        esac
+    done
+
+    if [ ! -f "$iso_path" ]; then
+        msg "ERROR" "ISO file not found at the specified path."
+        exit 1
+    fi
+
+    list_usb_drives
+    read -p "Enter the device name of your USB drive (e.g., /dev/sdb): " usb_device
+
+    if [ ! -b "$usb_device" ]; then
+        msg "ERROR" "The specified device is not a valid block device."
+        exit 1
+    fi
+
+    if [ "$os_type" == "Linux" ]; then
+        create_linux_bootable "$iso_path" "$usb_device"
+    elif [ "$os_type" == "Windows" ]; then
+        create_windows_bootable "$iso_path" "$usb_device"
+    fi
+}
+
+main
